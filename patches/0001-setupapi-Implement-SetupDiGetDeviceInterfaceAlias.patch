@@ -1,0 +1,163 @@
+From b1592b998fa8ef0939d3b736a51993a24f87ddcc Mon Sep 17 00:00:00 2001
+From: James <james@realtone.local>
+Date: Thu, 5 Nov 2026 09:30:16 -0600
+Subject: [PATCH] setupapi: Implement SetupDiGetDeviceInterfaceAlias
+
+---
+ dlls/setupapi/devinst.c     | 126 ++++++++++++++++++++++++++++++++++++
+ dlls/setupapi/setupapi.spec |   2 +-
+ 2 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index bd1f2c6..ae461c3 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -3056,6 +3056,132 @@ BOOL WINAPI SetupDiEnumDeviceInterfaces(HDEVINFO devinfo,
+     return FALSE;
+ }
+ 
++
++/***********************************************************************
++ *		SetupDiGetDeviceInterfaceAlias (SETUPAPI.@)
++ *
++ * Return the device interface registered for the same device instance as
++ * DeviceInterfaceData, but belonging to AliasInterfaceClassGuid.
++ *
++ * PARAMS
++ *   DeviceInfoSet            [I] Set containing DeviceInterfaceData
++ *   DeviceInterfaceData      [I] A device interface belonging to the set
++ *   AliasInterfaceClassGuid  [I] Interface class of the alias
++ *   AliasDeviceInterfaceData [O] Returns the alias interface
++ *
++ * RETURNS
++ *   Success: non-zero value.
++ *   Failure: FALSE.  Call GetLastError() for more info.
++ */
++BOOL WINAPI SetupDiGetDeviceInterfaceAlias(HDEVINFO devinfo,
++        SP_DEVICE_INTERFACE_DATA *iface_data, const GUID *alias_class,
++        SP_DEVICE_INTERFACE_DATA *alias_iface_data)
++{
++    struct device_iface *iface, *alias;
++    struct device *device;
++    WCHAR alias_class_str[39], path[MAX_PATH];
++    HKEY class_key, iface_key, refstr_key;
++    DWORD i, j, len, dataType;
++    LONG l = ERROR_SUCCESS;
++
++    TRACE("devinfo %p, iface_data %p, alias_class %s, alias_iface_data %p.\n",
++            devinfo, iface_data, debugstr_guid(alias_class), alias_iface_data);
++
++    if (!alias_class || !alias_iface_data
++            || alias_iface_data->cbSize != sizeof(SP_DEVICE_INTERFACE_DATA))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    if (!(iface = get_device_iface(devinfo, iface_data)))
++        return FALSE;
++
++    device = iface->device;
++
++    /* the alias may already have been enumerated into the set */
++    LIST_FOR_EACH_ENTRY(alias, &device->interfaces, struct device_iface, entry)
++    {
++        if (IsEqualGUID(&alias->class, alias_class))
++        {
++            copy_device_iface_data(alias_iface_data, alias);
++            return TRUE;
++        }
++    }
++
++    /* otherwise search the registry for interfaces of the alias class that
++     * belong to the same device instance */
++    SETUPDI_GuidToString(alias_class, alias_class_str);
++    lstrcpyW(path, DeviceClasses);
++    lstrcatW(path, L"\\");
++    lstrcatW(path, alias_class_str);
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &class_key))
++    {
++        SetLastError(ERROR_NOT_FOUND);
++        return FALSE;
++    }
++
++    for (i = 0; !l; i++)
++    {
++        WCHAR sub_key_name[MAX_PATH], device_inst[MAX_PATH * 3];
++
++        len = ARRAY_SIZE(sub_key_name);
++        l = RegEnumKeyExW(class_key, i, sub_key_name, &len, NULL, NULL, NULL, NULL);
++        if (l)
++            break;
++
++        if (RegOpenKeyExW(class_key, sub_key_name, 0, KEY_READ, &iface_key))
++            continue;
++
++        len = sizeof(device_inst);
++        if (RegQueryValueExW(iface_key, L"DeviceInstance", NULL, &dataType,
++                    (BYTE *)device_inst, &len)
++                || dataType != REG_SZ || lstrcmpiW(device_inst, device->instanceId))
++        {
++            RegCloseKey(iface_key);
++            continue;
++        }
++
++        for (j = 0; ; j++)
++        {
++            len = ARRAY_SIZE(sub_key_name);
++            l = RegEnumKeyExW(iface_key, j, sub_key_name, &len, NULL, NULL, NULL, NULL);
++            if (l)
++                break;
++
++            /* the subkey name is the reference string, with a '#' prepended */
++            if (*sub_key_name != '#')
++                continue;
++
++            if (RegOpenKeyExW(iface_key, sub_key_name, 0, KEY_READ, &refstr_key))
++                continue;
++
++            alias = SETUPDI_CreateDeviceInterface(device, alias_class, sub_key_name + 1);
++            if (alias)
++            {
++                WCHAR symbolic_link[MAX_PATH];
++
++                len = sizeof(symbolic_link);
++                if (!RegQueryValueExW(refstr_key, L"SymbolicLink", NULL, &dataType,
++                            (BYTE *)symbolic_link, &len) && dataType == REG_SZ)
++                    SETUPDI_SetInterfaceSymbolicLink(alias, symbolic_link);
++                copy_device_iface_data(alias_iface_data, alias);
++                RegCloseKey(refstr_key);
++                RegCloseKey(iface_key);
++                RegCloseKey(class_key);
++                return TRUE;
++            }
++            RegCloseKey(refstr_key);
++        }
++        l = ERROR_SUCCESS;
++        RegCloseKey(iface_key);
++    }
++
++    RegCloseKey(class_key);
++    SetLastError(ERROR_NOT_FOUND);
++    return FALSE;
++}
++
+ /***********************************************************************
+  *		SetupDiDestroyDeviceInfoList (SETUPAPI.@)
+   *
+diff --git a/dlls/setupapi/setupapi.spec b/dlls/setupapi/setupapi.spec
+index 9ac1c6c..3f89c50 100644
+--- a/dlls/setupapi/setupapi.spec
++++ b/dlls/setupapi/setupapi.spec
+@@ -354,7 +354,7 @@
+ @ stdcall SetupDiGetDeviceInstallParamsW(ptr ptr ptr)
+ @ stdcall SetupDiGetDeviceInstanceIdA(ptr ptr ptr long ptr)
+ @ stdcall SetupDiGetDeviceInstanceIdW(ptr ptr ptr long ptr)
+-@ stub SetupDiGetDeviceInterfaceAlias
++@ stdcall SetupDiGetDeviceInterfaceAlias(ptr ptr ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfaceDetailA(long ptr ptr long ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfaceDetailW(long ptr ptr long ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfacePropertyKeys(ptr ptr ptr long ptr long)
+-- 
+2.56.0
+

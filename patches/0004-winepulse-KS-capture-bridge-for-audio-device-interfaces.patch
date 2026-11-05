@@ -1,0 +1,674 @@
+From 43564028e252d8da0c779a406f4069520a786c32 Mon Sep 17 00:00:00 2001
+From: James <james@realtone.local>
+Date: Thu, 5 Nov 2026 09:30:17 -0600
+Subject: [PATCH] winepulse: KS capture bridge for audio device interfaces
+
+---
+ dlls/mmdevapi/unixlib.h            |  18 ++
+ dlls/winealsa.drv/alsa.c           |   2 +
+ dlls/winecoreaudio.drv/coreaudio.c |   2 +
+ dlls/wineoss.drv/oss.c             |   2 +
+ dlls/winepulse.drv/pulse.c         | 482 ++++++++++++++++++++++++++---
+ 5 files changed, 468 insertions(+), 38 deletions(-)
+
+diff --git a/dlls/mmdevapi/unixlib.h b/dlls/mmdevapi/unixlib.h
+index 3df13e9..0e60087 100644
+--- a/dlls/mmdevapi/unixlib.h
++++ b/dlls/mmdevapi/unixlib.h
+@@ -350,5 +350,23 @@ enum unix_funcs
+     midi_in_message,
+     midi_notify_wait,
+     aux_message,
++    ks_capture_ctl,
+     funcs_count
+ };
++
++/* Realtone project: KS capture bridge. The game's WDM-KS capture pin is
++ * emulated in kernelbase DeviceIoControl; this call funnels its audio
++ * requests to the real PulseAudio/PipeWire source of the Realtone cable
++ * (the only audio backend already connected in-process). */
++struct ks_capture_params
++{
++    unsigned int cmd;       /* 0=start 1=read 2=stop 3=stats 4=pump */
++    unsigned int rate;      /* in:  requested rate (start) */
++    unsigned int channels;  /* in:  requested channels (start) */
++    void *buffer;           /* in:  dest (read) / cyclic buffer (pump) */
++    unsigned int bytes;     /* in:  request size; out: bytes moved */
++    unsigned int used;      /* out: real bytes moved (rest zero-padded) */
++    unsigned int total_lo;  /* out: total bytes (lo/hi split: 32/64-safe) */
++    unsigned int total_hi;
++    unsigned int status;    /* out: 0 ok, 1 no source, 2 not running, 3 no memory */
++};
+diff --git a/dlls/winealsa.drv/alsa.c b/dlls/winealsa.drv/alsa.c
+index aea4ddf..ad96418 100644
+--- a/dlls/winealsa.drv/alsa.c
++++ b/dlls/winealsa.drv/alsa.c
+@@ -2454,6 +2454,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     alsa_midi_in_message,
+     alsa_midi_notify_wait,
+     alsa_not_implemented,
++    alsa_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2911,6 +2912,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     alsa_wow64_midi_in_message,
+     alsa_wow64_midi_notify_wait,
+     alsa_not_implemented,
++    alsa_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+diff --git a/dlls/winecoreaudio.drv/coreaudio.c b/dlls/winecoreaudio.drv/coreaudio.c
+index da2ae2d..379da26 100644
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -1817,6 +1817,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     unix_midi_in_message,
+     unix_midi_notify_wait,
+     unix_not_implemented,
++    unix_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2273,6 +2274,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     unix_wow64_midi_in_message,
+     unix_wow64_midi_notify_wait,
+     unix_not_implemented,
++    unix_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+diff --git a/dlls/wineoss.drv/oss.c b/dlls/wineoss.drv/oss.c
+index bcdcc72..65c279c 100644
+--- a/dlls/wineoss.drv/oss.c
++++ b/dlls/wineoss.drv/oss.c
+@@ -1674,6 +1674,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     oss_midi_in_message,
+     oss_midi_notify_wait,
+     oss_aux_message,
++    oss_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2170,6 +2171,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     oss_wow64_midi_in_message,
+     oss_wow64_midi_notify_wait,
+     oss_wow64_aux_message,
++    oss_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index c051a9a..922127e 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -29,6 +29,8 @@
+ #include <stdint.h>
+ #include <pthread.h>
+ #include <math.h>
++#include <ctype.h>
++#include <unistd.h>
+ #include <poll.h>
+ 
+ #include <pulse/pulseaudio.h>
+@@ -139,6 +141,9 @@ static pa_mainloop *pulse_ml;
+ static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
+ static struct list g_phys_sources = LIST_INIT(g_phys_sources);
+ 
++static void pulse_set_default_format(PhysDevice *dev);
++static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATEXTENSIBLE *fmt, REFERENCE_TIME *def_period, REFERENCE_TIME *min_period);
++
+ static pthread_mutex_t pulse_mutex;
+ static pthread_cond_t pulse_cond = PTHREAD_COND_INITIALIZER;
+ 
+@@ -314,13 +319,16 @@ static NTSTATUS pulse_main_loop(void *args)
+     struct main_loop_params *params = args;
+     int ret;
+     pulse_lock();
+-    pulse_ml = pa_mainloop_new();
+-    pa_mainloop_set_poll_func(pulse_ml, pulse_poll_func, NULL);
++    if (!pulse_ml) {
++        pulse_ml = pa_mainloop_new();
++        pa_mainloop_set_poll_func(pulse_ml, pulse_poll_func, NULL);
++    }
+     NtSetEvent(params->event, NULL);
+     pthread_cleanup_push(pulse_main_loop_thread_cleanup, NULL);
+     pa_mainloop_run(pulse_ml, &ret);
+     pthread_cleanup_pop(0);
+     pa_mainloop_free(pulse_ml);
++    pulse_ml = NULL;
+     pulse_unlock();
+     return STATUS_SUCCESS;
+ }
+@@ -698,6 +706,7 @@ static void pulse_add_device(struct list *list, pa_proplist *proplist, int index
+     dev->def_period = 0;
+     dev->min_period = 0;
+     fill_device_info(dev, proplist);
++    pulse_set_default_format(dev);
+     memcpy(dev->pulse_name, pulse_name, len + 1);
+ 
+     list_add_tail(list, &dev->entry);
+@@ -731,6 +740,95 @@ static void pulse_phys_sources_cb(pa_context *c, const pa_source_info *i, int eo
+         (i->monitor_of_sink == PA_INVALID_INDEX) ? Microphone : LineLevel, 0, i->name, i->description);
+ }
+ 
++static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATEXTENSIBLE *fmt, REFERENCE_TIME *def_period, REFERENCE_TIME *min_period);
++
++/* Fill in a sane default format for a device that hasn't been probed yet.
++ * Mirrors what pulse_probe_settings ends up with when its probe stream
++ * fails. Devices discovered through hotplug refreshes rely on this. */
++static void pulse_set_default_format(PhysDevice *dev)
++{
++    pa_channel_map map;
++    pa_sample_spec ss;
++    unsigned int length;
++
++    pa_channel_map_init_auto(&map, 2, PA_CHANNEL_MAP_ALSA);
++    ss.rate = 48000;
++    ss.format = PA_SAMPLE_FLOAT32LE;
++    ss.channels = map.channels;
++    length = pa_frame_size(&ss);
++
++    dev->fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    dev->fmt.Format.nChannels = 2;
++    dev->fmt.Format.nSamplesPerSec = 48000;
++    dev->fmt.Format.wBitsPerSample = 32;
++    dev->fmt.Format.nBlockAlign = 8;
++    dev->fmt.Format.nAvgBytesPerSec = 48000 * 8;
++    dev->fmt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    dev->fmt.Samples.wValidBitsPerSample = 32;
++    dev->fmt.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
++    dev->fmt.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++    dev->def_period = dev->min_period = pa_bytes_to_usec(10 * length, &ss);
++}
++
++/* Rebuild the physical device lists from the server. When block is set the
++ * pending info operations are iterated to completion and the formats are
++ * probed synchronously (startup path, no mainloop thread yet). When block
++ * is zero the operations are merely issued; their callbacks fill in the
++ * lists as the mainloop thread dispatches them (hotplug path). */
++static void pulse_refresh_device_lists(pa_context *ctx, int block)
++{
++    PhysDevice *dev;
++    pa_operation *o;
++    int ret;
++
++    free_phys_device_lists();
++    list_init(&g_phys_speakers);
++    list_init(&g_phys_sources);
++
++    /* Burnout Paradise Remastered expects device name to have a space. */
++    pulse_add_device(&g_phys_speakers, NULL, 0, Speakers, 0, "", "PulseAudio Output");
++    pulse_add_device(&g_phys_sources, NULL, 0, Microphone, 0, "", "PulseAudio Input");
++
++    o = pa_context_get_sink_info_list(ctx, &pulse_phys_speakers_cb, NULL);
++    if (o) {
++        while (block && pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
++                pa_operation_get_state(o) == PA_OPERATION_RUNNING)
++        {}
++        pa_operation_unref(o);
++    }
++
++    o = pa_context_get_source_info_list(ctx, &pulse_phys_sources_cb, NULL);
++    if (o) {
++        while (block && pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
++                pa_operation_get_state(o) == PA_OPERATION_RUNNING)
++        {}
++        pa_operation_unref(o);
++    }
++
++    if (block) {
++        LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry) {
++            pulse_probe_settings(1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
++        }
++
++        LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
++            pulse_probe_settings(0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
++        }
++    }
++}
++
++static void pulse_subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t idx, void *userdata)
++{
++    pa_subscription_event_type_t facility = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
++    pa_subscription_event_type_t type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
++
++    if ((facility == PA_SUBSCRIPTION_EVENT_SINK || facility == PA_SUBSCRIPTION_EVENT_SOURCE) &&
++        (type == PA_SUBSCRIPTION_EVENT_NEW || type == PA_SUBSCRIPTION_EVENT_REMOVE))
++    {
++        TRACE("Pulse server device list changed, refreshing endpoints\n");
++        pulse_refresh_device_lists(c, 0);
++    }
++}
++
+ /* For most hardware on Windows, users must choose a configuration with an even
+  * number of channels (stereo, quad, 5.1, 7.1). Users can then disable
+  * channels, but those channels are still reported to applications from
+@@ -897,8 +995,7 @@ static void pulse_probe_settings(int render, const char *pulse_name, WAVEFORMATE
+ static NTSTATUS pulse_test_connect(void *args)
+ {
+     struct test_connect_params *params = args;
+-    PhysDevice *dev;
+-    pa_operation *o;
++    pa_operation *o = NULL;
+     int ret;
+     char *name = wstr_to_str(params->name);
+ 
+@@ -944,42 +1041,15 @@ static NTSTATUS pulse_test_connect(void *args)
+         pa_context_get_server(pulse_ctx),
+         pa_context_get_server_protocol_version(pulse_ctx));
+ 
+-    free_phys_device_lists();
+-    list_init(&g_phys_speakers);
+-    list_init(&g_phys_sources);
++    pulse_refresh_device_lists(pulse_ctx, 1);
+ 
+-    /* Burnout Paradise Remastered expects device name to have a space. */
+-    pulse_add_device(&g_phys_speakers, NULL, 0, Speakers, 0, "", "PulseAudio Output");
+-    pulse_add_device(&g_phys_sources, NULL, 0, Microphone, 0, "", "PulseAudio Input");
+-
+-    o = pa_context_get_sink_info_list(pulse_ctx, &pulse_phys_speakers_cb, NULL);
+-    if (o) {
+-        while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+-                pa_operation_get_state(o) == PA_OPERATION_RUNNING)
+-        {}
+-        pa_operation_unref(o);
+-    }
+-
+-    o = pa_context_get_source_info_list(pulse_ctx, &pulse_phys_sources_cb, NULL);
+-    if (o) {
+-        while (pa_mainloop_iterate(pulse_ml, 1, &ret) >= 0 &&
+-                pa_operation_get_state(o) == PA_OPERATION_RUNNING)
+-        {}
++    /* Subscribe to server device add/remove events so the endpoint lists can
++     * be refreshed while running (see pulse_subscribe_cb). The context and
++     * mainloop are deliberately kept alive for this. */
++    pa_context_set_subscribe_callback(pulse_ctx, pulse_subscribe_cb, NULL);
++    o = pa_context_subscribe(pulse_ctx, (pa_subscription_mask_t)(PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE), NULL, NULL);
++    if (o)
+         pa_operation_unref(o);
+-    }
+-
+-    LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry) {
+-        pulse_probe_settings(1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+-    }
+-
+-    LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
+-        pulse_probe_settings(0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+-    }
+-
+-    pa_context_unref(pulse_ctx);
+-    pulse_ctx = NULL;
+-    pa_mainloop_free(pulse_ml);
+-    pulse_ml = NULL;
+ 
+     pulse_unlock();
+ 
+@@ -2575,6 +2645,306 @@ static BOOL get_device_path(PhysDevice *dev, struct get_prop_value_params *param
+     return TRUE;
+ }
+ 
++
++/* ================= Realtone: KS capture bridge =================
++ * Serves the game's emulated WDM-KS capture pin (kernelbase
++ * DeviceIoControl) from the Realtone cable's real PulseAudio source.
++ * One record stream feeds a ring; consumers are either packet reads
++ * (IOCTL_KS_READ_STREAM) or poll-mode pumps (cyclic buffer + position). */
++
++#define KS_CAP_RING_BYTES 0x40000
++static pa_stream *ks_cap_stream;
++static BYTE *ks_cap_ring;
++static ULONGLONG ks_cap_total;   /* bytes captured into the ring (monotonic) */
++static ULONGLONG ks_cap_fill;    /* bytes currently readable in the ring */
++static ULONGLONG ks_cap_pumped;  /* bytes delivered to poll-mode buffers (monotonic) */
++static unsigned int ks_cap_rate, ks_cap_channels;
++/* WaveRT-with-notification bridge state (set by cmd=5 from kernelbase):
++ * the game's cyclic buffer + KS notification event are filled/signalled
++ * from the pulse read callback, so pacing works without game polling. */
++static BYTE *ks_notif_buf;
++static unsigned int ks_notif_size, ks_notif_stride;
++static unsigned long long ks_notif_event;   /* HANDLE of the game's event */
++static ULONGLONG ks_notif_last;             /* total at last event signal */
++static unsigned int ks_notif_pending;       /* events armed via cmd=5 */
++
++static BOOL ks_cap_name_has(const char *haystack, const char *needle)
++{
++    char h[256], n[32];
++    unsigned int i;
++    if (!haystack) return FALSE;
++    for (i = 0; haystack[i] && i < sizeof(h) - 1; i++)
++        h[i] = tolower((unsigned char)haystack[i]);
++    h[i] = 0;
++    for (i = 0; needle[i] && i < sizeof(n) - 1; i++)
++        n[i] = tolower((unsigned char)needle[i]);
++    n[i] = 0;
++    return strstr(h, n) != NULL;
++}
++
++/* runs on the pulse mainloop thread (pulse_mutex held by the loop) */
++static void ks_cap_read_cb(pa_stream *s, size_t length, void *userdata)
++{
++    const void *data;
++    SIZE_T n, wp, tail;
++
++    if (!ks_cap_ring || !length)
++        return;
++    if (pa_stream_peek(s, &data, &length) < 0)
++        return;
++    if (data && length)
++    {
++        n = min((SIZE_T)length, (SIZE_T)KS_CAP_RING_BYTES - ks_cap_fill);
++        wp = ks_cap_total % KS_CAP_RING_BYTES;
++        tail = min(n, (SIZE_T)KS_CAP_RING_BYTES - wp);
++        memcpy(ks_cap_ring + wp, data, tail);
++        if (n > tail)
++            memcpy(ks_cap_ring, (const BYTE *)data + tail, n - tail);
++        ks_cap_total += n;
++        ks_cap_fill += n;
++        if (n < length)
++            WARN("ks capture ring overflow, dropped %lu bytes\n", (unsigned long)(length - n));
++        if (ks_notif_buf && ks_notif_size)
++        {
++            /* drain the fresh chunk straight into the game's cyclic buffer.
++             * Use the FULL chunk (length), not the ring-limited n: the ring
++             * is packet-mode only; starving the pump here would freeze the
++             * notification cadence once the ring fills. */
++            SIZE_T m = min((SIZE_T)length, (SIZE_T)ks_notif_size), w, t2;
++            const BYTE *src = (const BYTE *)data;
++            SIZE_T done = 0;
++            while (done < m)
++            {
++                w = ks_cap_pumped % ks_notif_size;
++                t2 = min(m - done, ks_notif_size - w);
++                memcpy(ks_notif_buf + w, src + done, t2);
++                ks_cap_pumped += t2;
++                done += t2;
++            }
++            if (ks_notif_event && ks_notif_stride &&
++                ks_cap_pumped - ks_notif_last >= ks_notif_stride)
++            {
++                ks_notif_last = ks_cap_pumped;
++                NtSetEvent((void *)(UINT_PTR)ks_notif_event, NULL);
++            }
++        }
++    }
++    pa_stream_drop(s);
++}
++
++static SIZE_T ks_cap_copy_out(BYTE *dst, SIZE_T bytes)
++{
++    SIZE_T done = 0;
++    while (done < bytes && ks_cap_fill)
++    {
++        SIZE_T rp = (ks_cap_total - ks_cap_fill) % KS_CAP_RING_BYTES;
++        SIZE_T n = min(min(ks_cap_fill, bytes - done), (SIZE_T)KS_CAP_RING_BYTES - rp);
++        memcpy(dst + done, ks_cap_ring + rp, n);
++        ks_cap_fill -= n;
++        done += n;
++    }
++    return done;
++}
++
++static NTSTATUS pulse_ks_capture_ctl(void *args)
++{
++    struct ks_capture_params *p = args;
++
++    p->status = 0;
++    p->used = 0;
++    p->total_lo = 0;
++    p->total_hi = 0;
++
++    if (p->cmd == 0)
++    {
++        const char *source = NULL;
++        pa_sample_spec ss;
++        pa_buffer_attr attr;
++        PhysDevice *dev;
++
++        pulse_lock();
++        if (ks_cap_stream && ks_cap_rate == p->rate && ks_cap_channels == p->channels)
++        {
++            pulse_unlock();
++            return STATUS_SUCCESS;
++        }
++        if (!pulse_ctx || pa_context_get_state(pulse_ctx) != PA_CONTEXT_READY)
++        {
++            pulse_unlock();
++            p->status = 2;
++            return STATUS_SUCCESS;
++        }
++        if (ks_cap_stream)
++        {
++            pa_stream_disconnect(ks_cap_stream);
++            pa_stream_unref(ks_cap_stream);
++            ks_cap_stream = NULL;
++        }
++        /* prefer the exact VID/PID of the Realtone cable */
++        LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry)
++        {
++            if (dev->vendor_id == 0x12ba && dev->product_id == 0x00ff)
++            {
++                source = dev->pulse_name;
++                break;
++            }
++        }
++        if (!source)
++        {
++            LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry)
++            {
++                if (ks_cap_name_has(dev->pulse_name, "rocksmith"))
++                {
++                    source = dev->pulse_name;
++                    break;
++                }
++            }
++        }
++        if (!source)
++        {
++            pulse_unlock();
++            p->status = 1;
++            WARN("ks capture: no Rocksmith source in %u devices\n", list_count(&g_phys_sources));
++            return STATUS_SUCCESS;
++        }
++        ss.format = PA_SAMPLE_S16LE;
++        ss.rate = p->rate;
++        ss.channels = p->channels;
++        attr.maxlength = (uint32_t)-1;
++        attr.tlength = (uint32_t)-1;
++        attr.prebuf = (uint32_t)-1;
++        attr.minreq = (uint32_t)-1;
++        attr.fragsize = pa_usec_to_bytes(10 * PA_USEC_PER_MSEC, &ss);
++        if (!ks_cap_ring)
++            ks_cap_ring = malloc(KS_CAP_RING_BYTES);
++        if (!ks_cap_ring)
++        {
++            pulse_unlock();
++            p->status = 3;
++            return STATUS_SUCCESS;
++        }
++        ks_cap_total = ks_cap_fill = ks_cap_pumped = 0;
++        ks_cap_stream = pa_stream_new(pulse_ctx, "wine-ks-capture", &ss, NULL);
++        if (ks_cap_stream)
++        {
++            pa_stream_set_read_callback(ks_cap_stream, ks_cap_read_cb, NULL);
++            if (pa_stream_connect_record(ks_cap_stream, source, &attr, PA_STREAM_ADJUST_LATENCY) >= 0)
++            {
++                ks_cap_rate = p->rate;
++                ks_cap_channels = p->channels;
++                pulse_unlock();
++                TRACE("ks capture started: source %s rate %u ch %u fragsize %u\n",
++                      source, p->rate, p->channels, attr.fragsize);
++                return STATUS_SUCCESS;
++            }
++            pa_stream_unref(ks_cap_stream);
++            ks_cap_stream = NULL;
++        }
++        pulse_unlock();
++        p->status = 1;
++        WARN("ks capture: connect_record failed for %s\n", source);
++        return STATUS_SUCCESS;
++    }
++
++    if (p->cmd == 1) /* packet read: wait briefly for real data, pad on starvation */
++    {
++        SIZE_T done = 0;
++        unsigned int waited = 0;
++        while (done < p->bytes)
++        {
++            pulse_lock();
++            done += ks_cap_copy_out((BYTE *)p->buffer + done, p->bytes - done);
++            pulse_unlock();
++            if (done >= p->bytes || waited >= 200)
++                break;
++            usleep(2000);
++            waited += 2;
++        }
++        if (done < p->bytes)
++            memset((BYTE *)p->buffer + done, 0, p->bytes - done);
++        p->used = done;
++        return STATUS_SUCCESS;
++    }
++
++    if (p->cmd == 2) /* stop */
++    {
++        pulse_lock();
++        ks_notif_buf = NULL;
++        ks_notif_size = 0;
++        ks_notif_event = 0;
++        ks_notif_pending = 0;
++        if (ks_cap_stream)
++        {
++            pa_stream_disconnect(ks_cap_stream);
++            pa_stream_unref(ks_cap_stream);
++            ks_cap_stream = NULL;
++        }
++        pulse_unlock();
++        return STATUS_SUCCESS;
++    }
++
++    if (p->cmd == 3) /* stats */
++    {
++        pulse_lock();
++        p->total_lo = (unsigned int)ks_cap_total;
++        p->total_hi = (unsigned int)(ks_cap_total >> 32);
++        p->used = (unsigned int)ks_cap_fill;
++        pulse_unlock();
++        return STATUS_SUCCESS;
++    }
++
++    if (p->cmd == 4) /* poll-mode pump into the caller's cyclic buffer */
++    {
++        BYTE *dst = p->buffer;
++        SIZE_T size = p->bytes, chunk;
++        if (!dst || !size)
++            return STATUS_SUCCESS;
++        pulse_lock();
++        while (ks_cap_fill)
++        {
++            SIZE_T wp = ks_cap_pumped % size;
++            chunk = min(ks_cap_fill, size - wp);
++            ks_cap_copy_out(dst + wp, chunk);
++            ks_cap_pumped += chunk;
++        }
++        p->total_lo = (unsigned int)ks_cap_pumped;
++        p->total_hi = (unsigned int)(ks_cap_pumped >> 32);
++        pulse_unlock();
++        return STATUS_SUCCESS;
++    }
++
++    if (p->cmd == 5) /* arm WaveRT-with-notification bridge */
++    {
++        pulse_lock();
++        if (p->buffer && p->bytes && p->rate)
++        {
++            ks_notif_buf = p->buffer;
++            ks_notif_size = p->bytes;
++            ks_notif_event = (unsigned long long)p->rate;     /* HANDLE in rate */
++            ks_notif_stride = p->channels ? p->channels : p->bytes / 8;
++            ks_notif_last = ks_cap_pumped;
++            ks_notif_pending = 1;
++            TRACE("ks notif armed: buf %p size %u event %p stride %u\n",
++                  ks_notif_buf, ks_notif_size,
++                  (void *)(UINT_PTR)ks_notif_event, ks_notif_stride);
++        }
++        else
++        {
++            WARN("ks notif arm REJECTED: buf %p bytes %u rate %x channels %u\n",
++                 p->buffer, p->bytes, p->rate, p->channels);
++            ks_notif_buf = NULL;
++            ks_notif_size = 0;
++            ks_notif_event = 0;
++            ks_notif_pending = 0;
++        }
++        pulse_unlock();
++        return STATUS_SUCCESS;
++    }
++
++    p->status = 1;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS pulse_get_prop_value(void *args)
+ {
+     static const GUID PKEY_AudioEndpoint_GUID = {
+@@ -2678,6 +3048,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     pulse_not_implemented,
+     pulse_not_implemented,
+     pulse_not_implemented,
++    pulse_ks_capture_ctl,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -3137,6 +3508,40 @@ static NTSTATUS pulse_wow64_get_prop_value(void *args)
+     return STATUS_SUCCESS;
+ }
+ 
++
++static NTSTATUS pulse_wow64_ks_capture_ctl(void *args)
++{
++    struct
++    {
++        unsigned int cmd;
++        unsigned int rate;
++        unsigned int channels;
++        PTR32 buffer;
++        unsigned int bytes;
++        unsigned int used;
++        unsigned int total_lo;
++        unsigned int total_hi;
++        unsigned int status;
++    } *params32 = args;
++    struct ks_capture_params params;
++
++    params.cmd = params32->cmd;
++    params.rate = params32->rate;
++    params.channels = params32->channels;
++    params.buffer = (void *)(UINT_PTR)params32->buffer;
++    params.bytes = params32->bytes;
++    params.used = params32->used;
++    params.total_lo = params32->total_lo;
++    params.total_hi = params32->total_hi;
++    params.status = 0;
++    pulse_ks_capture_ctl(&params);
++    params32->used = params.used;
++    params32->total_lo = params.total_lo;
++    params32->total_hi = params.total_hi;
++    params32->status = params.status;
++    return STATUS_SUCCESS;
++}
++
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     pulse_process_attach,
+@@ -3176,6 +3581,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     pulse_not_implemented,
+     pulse_not_implemented,
+     pulse_not_implemented,
++    pulse_wow64_ks_capture_ctl,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+-- 
+2.56.0
+

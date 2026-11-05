@@ -1,0 +1,18 @@
+; Rocksmith.ini — RealtoneWine reference settings
+; Location: steamapps/common/Rocksmith2014/Rocksmith.ini
+; Only these keys matter for the cable path; keep the rest of your file as-is.
+
+[Audio]
+ForceWDM=0
+ExclusiveMode=0
+DumpAudioLog=1
+
+; Notes:
+; - ForceWDM=0 is the supported configuration (it is also what the game
+;   effectively runs on Windows 11, where the WDM-KS audio stack is no
+;   longer reachable by user-mode code).
+; - ExclusiveMode=1 also works: our Wine patch serves exclusive clients as
+;   shared, matching Windows behavior.
+; - DumpAudioLog=1 writes audiodump.txt next to this file while the game
+;   runs — the first place to look when reporting issues.
+; - LatencyBuffer=4 is the game default.

@@ -1,0 +1,1189 @@
+From d23ed47f95a62a7bb1155c8dd6ccb2a3e5a6b0d1 Mon Sep 17 00:00:00 2001
+From: James <james@realtone.local>
+Date: Thu, 5 Nov 2026 09:30:17 -0600
+Subject: [PATCH] kernelbase, ksuser: KS filter and probe emulation for audio
+ device interfaces
+
+---
+ dlls/kernelbase/file.c  | 707 ++++++++++++++++++++++++++++++++++++++++
+ dlls/ksuser/Makefile.in |   1 +
+ dlls/ksuser/ksuser.c    |  70 ++++
+ dlls/ksuser/ksuser.spec |   2 +-
+ dlls/mmdevapi/devenum.c | 266 +++++++++++++--
+ dlls/ntdll/unix/file.c  |  11 +
+ 6 files changed, 1020 insertions(+), 37 deletions(-)
+ create mode 100644 dlls/ksuser/ksuser.c
+
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 6a821d7..36c8c9a 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -815,6 +815,38 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileW( LPCWSTR filename, DWORD access, DWO
+     };
+ 
+ 
++    /* Realtone diagnostic: KS device-interface paths (KSCATEGORY_* etc.)
++     * have no backing NT device in Wine yet; map them to the null device so
++     * presence probes by applications (e.g. Rocksmith 2014's cable scan)
++     * can proceed to their next stage instead of hard-failing. */
++    if (!wcsnicmp( filename, L"\\\\?\\", 4 ))
++    {
++        static const WCHAR *const ks_markers[] = {
++            L"{6994AD04-", L"{65E8773D-", L"{65E8773E-", L"{EB115FFC-",
++        };
++        const WCHAR *brace = wcschr( filename, L'{' );
++        DWORD i;
++        for (i = 0; brace && i < ARRAY_SIZE( ks_markers ); i++)
++            if (!wcsnicmp( brace, ks_markers[i], 10 ))
++            {
++                {
++                    void *caller = NULL, *caller2 = NULL;
++                    HMODULE mod = NULL;
++                    char modname[80] = "?";
++                    RtlCaptureStackBackTrace( 1, 2, &caller, NULL );
++                    RtlCaptureStackBackTrace( 2, 1, &caller2, NULL );
++                    if (caller && GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                                      (LPCWSTR)caller, &mod ) && mod)
++                        GetModuleFileNameA( mod, modname, sizeof(modname) );
++                    TRACE( "Realtone diagnostic: redirecting KS interface path to NUL caller=%p %s+0x%lx ret2=%p\n",
++                           caller, modname, (unsigned long)((const char *)caller - (const char *)mod), caller2 );
++                }
++                filename = L"\\\\.\\NUL";
++                break;
++            }
++    }
++
+     /* sanity checks */
+ 
+     if (!filename || !filename[0])
+@@ -4358,6 +4390,184 @@ BOOL WINAPI DECLSPEC_HOTPATCH ClearCommError( HANDLE handle, DWORD *errors, COMS
+ /****************************************************************************
+  *	DeviceIoControl   (kernelbase.@)
+  */
++/* Realtone diagnostic: per-pin context for the WaveRT pin emulation
++ * (the diagnostic runs inside the game process, so buffer addresses we
++ * hand out are directly usable by the application). */
++static HANDLE rtaudio_handles[8];
++static DWORD rtaudio_states[8];
++static ULONG rtaudio_sizes[8];
++static DWORD rtaudio_starts[8];
++static BYTE *rtaudio_bufs[8];
++static int rtaudio_handle_count;
++
++/* Realtone: bridge to winepulse's unix lib for real capture audio.
++ * Struct/func index MUST match dlls/mmdevapi/unixlib.h (ks_capture_ctl). */
++struct realtone_ks_params
++{
++    unsigned int cmd;       /* 0=start 1=read 2=stop 3=stats 4=pump */
++    unsigned int rate;
++    unsigned int channels;
++    void *buffer;
++    unsigned int bytes;
++    unsigned int used;
++    unsigned int total_lo;
++    unsigned int total_hi;
++    unsigned int status;
++};
++static unsigned long long realtone_pulse_handle;
++static NTSTATUS (WINAPI *realtone_unix_call)( unsigned long long, unsigned int, void * );
++static char realtone_ks_mode[8];          /* per rtaudio slot: 0 none, 1 packets, 2 poll */
++static unsigned long realtone_ks_served[8];
++
++static BOOL realtone_ks_call( struct realtone_ks_params *p )
++{
++    HMODULE mod;
++
++    if (!realtone_unix_call)
++    {
++        HMODULE ntdll = GetModuleHandleW( L"ntdll.dll" );
++        void *fn = ntdll ? GetProcAddress( ntdll, "__wine_unix_call_dispatcher" ) : NULL;
++        if (!fn || !*(void **)fn)
++        {
++            TRACE("Realtone: no unix call dispatcher\n");
++            return FALSE;
++        }
++        realtone_unix_call = *(NTSTATUS (WINAPI **)( unsigned long long, unsigned int, void * ))fn;
++    }
++    if (!realtone_pulse_handle)
++    {
++        unsigned long long h;
++        if (!(mod = LoadLibraryW( L"winepulse.drv" )))
++        {
++            TRACE("Realtone: winepulse.drv not loadable\n");
++            return FALSE;
++        }
++        if (NtQueryVirtualMemory( GetCurrentProcess(), mod, MemoryWineUnixFuncs,
++                                  &h, sizeof(h), NULL ))
++        {
++            TRACE("Realtone: no unix funcs on winepulse\n");
++            return FALSE;
++        }
++        realtone_pulse_handle = h;
++    }
++    realtone_unix_call( realtone_pulse_handle, 37 /* ks_capture_ctl */, p );
++    if (p->cmd != 1)
++        TRACE("Realtone: ks_call cmd=%u status=%u used=%u buf=%p bytes=%u totlo=%x\n",
++              p->cmd, p->status, p->used, p->buffer, p->bytes, p->total_lo);
++    return TRUE;
++}
++
++/* Start the capture (idempotent). The game opens its input at 44100 Hz mono
++ * 16-bit (audiodump-verified); PipeWire resamples the 48 kHz source. */
++static void realtone_ks_ensure_started(void)
++{
++    struct realtone_ks_params kp;
++    static int attempted;
++
++    if (attempted) return;
++    attempted = 1;
++    memset(&kp, 0, sizeof(kp));
++    kp.cmd = 0;
++    kp.rate = 44100;
++    kp.channels = 1;
++    if (realtone_ks_call(&kp))
++        TRACE("Realtone: ks capture start status=%u\n", kp.status);
++}
++
++static int realtone_slot_of(HANDLE h)
++{
++    int idx;
++    for (idx = 0; idx < 8; idx++)
++        if (rtaudio_handles[idx] == h) return idx;
++    for (idx = 0; idx < 8; idx++)
++        if (!rtaudio_handles[idx]) { rtaudio_handles[idx] = h; return idx; }
++    return 0;
++}
++
++/* Realtone: pending READ_STREAM queue. A real WaveCyclic capture pin PENDS
++ * each read until a packet is available; completing instantly raced the
++ * game's post->wait->process->repost protocol (it posted 4 packets, saw them
++ * all complete pre-wait, and shut its input thread down). We now queue the
++ * read and complete it from a pacing thread as the capture data arrives. */
++static struct
++{
++    OVERLAPPED *ov;
++    void *buf;
++    ULONG bytes;
++    int used;
++} realtone_pend[16];
++static RTL_CRITICAL_SECTION realtone_pend_cs;
++static int realtone_pend_cs_init;
++static HANDLE realtone_pacer_thread;
++
++static DWORD WINAPI realtone_pacer(void *arg)
++{
++    for (;;)
++    {
++        int i, target = -1;
++        OVERLAPPED *ov;
++        void *buf;
++        ULONG bytes;
++        struct realtone_ks_params kp;
++
++        RtlEnterCriticalSection( &realtone_pend_cs );
++        for (i = 0; i < 16; i++)
++            if (realtone_pend[i].used) { target = i; break; }
++        if (target >= 0)
++        {
++            ov = realtone_pend[target].ov;
++            buf = realtone_pend[target].buf;
++            bytes = realtone_pend[target].bytes;
++            realtone_pend[target].used = 0;
++        }
++        RtlLeaveCriticalSection( &realtone_pend_cs );
++        if (target < 0) { Sleep( 5 ); continue; }
++
++        realtone_ks_ensure_started();
++        memset( &kp, 0, sizeof(kp) );
++        kp.cmd = 1;
++        kp.buffer = buf;
++        kp.bytes = bytes;
++        if (!realtone_ks_call( &kp ) || kp.status)
++            memset( buf, 0, bytes );
++        ov->Internal = 0;               /* STATUS_SUCCESS */
++        ov->InternalHigh = bytes;
++        if (ov->hEvent) SetEvent( ov->hEvent );
++    }
++    return 0;
++}
++
++static BOOL realtone_queue_read( OVERLAPPED *ov, void *buf, ULONG bytes )
++{
++    int i;
++    if (!realtone_pend_cs_init)
++    {
++        static LONG once;
++        if (InterlockedCompareExchange( &once, 1, 0 ) == 0)
++        {
++            int j;
++            for (j = 0; j < 16; j++) realtone_pend[j].used = 0;
++            RtlInitializeCriticalSection( &realtone_pend_cs );
++            realtone_pend_cs_init = 1;
++            realtone_pacer_thread = CreateThread( NULL, 0, realtone_pacer, NULL, 0, NULL );
++        }
++    }
++    if (!realtone_pacer_thread) return FALSE;
++    RtlEnterCriticalSection( &realtone_pend_cs );
++    for (i = 0; i < 16; i++)
++        if (!realtone_pend[i].used)
++        {
++            realtone_pend[i].ov = ov;
++            realtone_pend[i].buf = buf;
++            realtone_pend[i].bytes = bytes;
++            realtone_pend[i].used = 1;
++            RtlLeaveCriticalSection( &realtone_pend_cs );
++            return TRUE;
++        }
++    RtlLeaveCriticalSection( &realtone_pend_cs );
++    return FALSE;
++}
++
+ BOOL WINAPI DECLSPEC_HOTPATCH DeviceIoControl( HANDLE handle, DWORD code, void *in_buff, DWORD in_count,
+                                                void *out_buff, DWORD out_count, DWORD *returned,
+                                                OVERLAPPED *overlapped )
+@@ -4369,6 +4579,503 @@ BOOL WINAPI DECLSPEC_HOTPATCH DeviceIoControl( HANDLE handle, DWORD code, void *
+ 
+     TRACE( "(%p,%lx,%p,%ld,%p,%ld,%p,%p)\n",
+            handle, code, in_buff, in_count, out_buff, out_count, returned, overlapped );
++    /* Realtone diagnostic: KS stream I/O (IOCTL_KS_READ_STREAM /
++     * IOCTL_KS_WRITE_STREAM) for the WaveCyclic capture path the game's
++     * vendored PortAudio uses. Completes each packet synchronously with
++     * silence and signals the caller's event, so the capture loop runs. */
++    if ((code == 0x2f4017 || code == 0x2f4013) && out_buff && out_count >= 48)
++    {
++        /* Classic 32-bit KSSTREAM_HEADER (Size=0x30, live-dump verified):
++         * +0 Size, +4 TypeSpecificFlags, +8 PresentationTime(16), +0x18
++         * Duration, +0x20 FrameExtent, +0x24 DataUsed, +0x28 Data,
++         * +0x2C OptionsFlags. The game passes one 48-byte header/call. */
++        ULONG *frameExtent32 = (ULONG *)((char *)out_buff + 0x20);
++        ULONG *dataUsed32 = (ULONG *)((char *)out_buff + 0x24);
++        void **data = (void **)((char *)out_buff + 0x28);
++        ULONG frameExtent = *frameExtent32;
++
++        if (code == 0x2f4017 && *data && frameExtent)
++        {
++            /* capture: serve REAL audio from the cable's PipeWire source via
++             * winepulse; silence-padded on starvation; silence on bridge failure */
++            struct realtone_ks_params kp;
++            int slot = realtone_slot_of(handle);
++            realtone_ks_ensure_started();
++            memset(&kp, 0, sizeof(kp));
++            kp.cmd = 1;
++            kp.buffer = *data;
++            kp.bytes = frameExtent;
++            if (!realtone_ks_call(&kp) || kp.status)
++                memset(*data, 0, frameExtent);
++            else
++            {
++                realtone_ks_mode[slot] = 1;
++                realtone_ks_served[slot] += frameExtent;
++                if ((realtone_ks_served[slot] & 0xffff) < frameExtent)
++                {
++                    /* frequent health line: peak amplitude of this packet */
++                    int i, peak = 0;
++                    const short *s = (const short *)*data;
++                    for (i = 0; i < (int)(frameExtent / 2) && i < 4096; i++)
++                    {
++                        int v = s[i] < 0 ? -(int)s[i] : (int)s[i];
++                        if (v > peak) peak = v;
++                    }
++                    TRACE("Realtone: KS read pkt bytes=%lu used=%u peak=%d served=%lu\n",
++                          (unsigned long)frameExtent, kp.used, peak,
++                          realtone_ks_served[slot]);
++                }
++            }
++        }
++        if (frameExtent)
++            *dataUsed32 = frameExtent;
++        if (overlapped && code == 0x2f4017 && *data && frameExtent)
++        {
++            /* real WaveCyclic semantics: the read PENDS until a packet is
++             * available; the pacing thread completes it with capture data */
++            if (realtone_queue_read( overlapped, *data, frameExtent ))
++            {
++                SetLastError( ERROR_IO_PENDING );
++                return FALSE;
++            }
++            /* queue full: fall through to synchronous completion */
++        }
++        if (overlapped)
++        {
++            overlapped->Internal = 0;               /* STATUS_SUCCESS */
++            overlapped->InternalHigh = frameExtent;
++            if (overlapped->hEvent)
++                SetEvent(overlapped->hEvent);
++        }
++        TRACE("Realtone diagnostic: KS stream %s %lu bytes\n",
++              code == 0x2f4017 ? "read" : "write", (unsigned long)frameExtent);
++        SetLastError(0);
++        return TRUE;
++    }
++
++    /* Realtone diagnostic: emulate a minimal KS capture filter so the
++     * game's scan can proceed. Sets observed from Rocksmith 2014:
++     * KSPROPSETID_Pin {8C134960-51AD-11CF-878A-94F801C10000},
++     * KSPROPSETID_General {720D4AC0-7533-11D0-A5D6-28DB04C10000},
++     * KSPROPSETID_Topology {1464EDA5-6A8F-11D1-9AA7-00A0C9223196}. */
++    if (code == 0x2f0003 && in_buff && in_count >= 8) /* Realtone diag: log all sizes */
++    {
++        const DWORD *kp = in_buff; /* KSPROPERTY: Set[4], Id, Flags */
++        DWORD set0 = kp[0];
++        DWORD id = 0, flags = 0, pinid = 0;
++
++        if (in_count >= 24) { id = kp[4]; flags = kp[5]; }
++        if (in_count >= 28) pinid = kp[6];
++
++        {
++            void *caller = NULL, *caller2 = NULL;
++            DWORD frames = RtlCaptureStackBackTrace( 1, 2, &caller, (DWORD *)&caller2 );
++            HMODULE mod = NULL;
++            char modname[64] = "?";
++            if (frames && GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                              (LPCWSTR)caller, &mod ) && mod)
++                GetModuleFileNameA( mod, modname, sizeof(modname) );
++            TRACE( "Realtone diagnostic: KS probe set=%08x id=%u flags=%u pin=%u in=%u out=%u caller=%p caller2=%p %s+0x%lx\n",
++                   (unsigned)set0, (unsigned)id, (unsigned)flags, (unsigned)pinid,
++                   (unsigned)in_count, (unsigned)out_count, caller, caller2, modname,
++                   (unsigned long)((const char *)caller - (const char *)mod) );
++            if (caller2 && !((ULONG_PTR)caller2 & 1))
++            {
++                /* the packer re-encrypts code pages after use; the caller's
++                 * page is only readable DURING this call — dump the bytes */
++                const unsigned char *cp = (const unsigned char *)caller2 - 0x20;
++                TRACE( "Realtone: caller2 bytes-20: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++                       cp[0],cp[1],cp[2],cp[3],cp[4],cp[5],cp[6],cp[7],cp[8],cp[9],cp[10],cp[11],cp[12],cp[13],cp[14],cp[15],
++                       cp[16],cp[17],cp[18],cp[19],cp[20],cp[21],cp[22],cp[23],cp[24],cp[25],cp[26],cp[27],cp[28],cp[29],cp[30],cp[31]);
++            }
++        }
++
++        /* Realtone diagnostic: WaveRT pin emulation (KSPROPSETID_RtAudio
++         * {1D58C920-AC9B-11CF-8E5D-0020AF0B7EC9}), pin connection state
++         * (KSPROPSETID_Connection {6A174AC0-...}) and stream position
++         * (KSPROPSETID_Audio {1155A920-...}). PortAudio's WDM-KS backend
++         * (vendored in Rocksmith 2014) needs these on the instantiated pin
++         * to finish opening a capture stream. */
++        if (set0 == 0x1d58c920)
++        {
++            int idx;
++
++            for (idx = 0; idx < 8; idx++)
++                if (rtaudio_handles[idx] == handle) break;
++            if (idx == 8 && rtaudio_handle_count < 8)
++            {
++                idx = realtone_slot_of(handle);
++                rtaudio_handle_count = max(rtaudio_handle_count, idx + 1);
++                rtaudio_handles[idx] = handle;
++                rtaudio_states[idx] = 0;
++                rtaudio_sizes[idx] = 0;
++                rtaudio_bufs[idx] = NULL;
++            }
++            if (idx < 8 && id == 0 && (flags & 0xfffffff9) == 0x00000001 && in_count >= 32)
++            {
++                /* KSPROPERTY_RTAUDIO_BUFFER: hand out a real cyclic buffer */
++                ULONG requested = *(const DWORD *)((const char *)in_buff + 28);
++                if (!rtaudio_bufs[idx])
++                {
++                    rtaudio_bufs[idx] = VirtualAlloc(NULL, 0x200000, MEM_COMMIT, PAGE_READWRITE);
++                    rtaudio_starts[idx] = GetTickCount();
++                }
++                if (!rtaudio_bufs[idx])
++                {
++                    SetLastError(ERROR_OUTOFMEMORY);
++                    return FALSE;
++                }
++                rtaudio_sizes[idx] = requested && requested < 0x200000 ? requested : 0x200000;
++                if (out_buff && out_count >= 12)
++                {
++                    *(DWORD *)out_buff = (DWORD)(UINT_PTR)rtaudio_bufs[idx];
++                    *(DWORD *)((char *)out_buff + 4) = rtaudio_sizes[idx];
++                    *(DWORD *)((char *)out_buff + 8) = 0; /* CallMemoryBarrier */
++                    if (returned) *returned = 12;
++                    TRACE("Realtone diagnostic: RTAUDIO_BUFFER -> buf=%p size=%lu\n",
++                          rtaudio_bufs[idx], (unsigned long)rtaudio_sizes[idx]);
++                    SetLastError(0);
++                    return TRUE;
++                }
++                TRACE("Realtone diagnostic: RTAUDIO_BUFFER -> MORE_DATA need=12\n");
++                SetLastError(ERROR_MORE_DATA);
++                if (returned) *returned = 12;
++                return FALSE;
++            }
++            if (idx < 8 && id == 0 && flags == 0x00000003)
++            {
++                /* BASICSUPPORT for RTAUDIO_BUFFER: GET|SET access flags */
++                if (out_buff && out_count >= 4)
++                {
++                    *(DWORD *)out_buff = 0x00000003;
++                    if (returned) *returned = 4;
++                    TRACE("Realtone diagnostic: RTAUDIO BUFFER basicsupport -> 0x3\n");
++                    SetLastError(0);
++                    return TRUE;
++                }
++                SetLastError(ERROR_MORE_DATA);
++                if (returned) *returned = 4;
++                return FALSE;
++            }
++            if (idx < 8 && id == 0 && (flags & 0x00000002))
++            {
++                /* SET of RTAUDIO_BUFFER: succeed (buffer already mapped) */
++                TRACE("Realtone diagnostic: RTAUDIO BUFFER set (no-op)\n");
++                SetLastError(0);
++                if (returned) *returned = 0;
++                return TRUE;
++            }
++            if (idx < 8 && id == 3 && (flags & 0x00000001))
++            {
++                /* KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION GET:
++                 * KSRTAUDIO_BUFFER_WITH_NOTIFICATION (32-bit):
++                 * {PVOID BufferAddress, ULONG ActualSize, ULONG CallMemoryBarrier,
++                 *  ULONG NotificationCount, HANDLE NotificationEvent} = 20 bytes.
++                 * Hand out a real cyclic buffer + our event; winepulse's pulse
++                 * read callback fills the buffer and signals the event. */
++                static const ULONG notif_size = 0x10000; /* 64 KiB (~743 ms @44.1k mono16) */
++                if (out_buff && out_count >= 20)
++                {
++                    BYTE *buf = VirtualAlloc(NULL, notif_size, MEM_COMMIT, PAGE_READWRITE);
++                    HANDLE ev;
++                    struct realtone_ks_params kp;
++
++                    if (!buf)
++                    {
++                        SetLastError(ERROR_OUTOFMEMORY);
++                        return FALSE;
++                    }
++                    memset(buf, 0, notif_size);
++                    ev = CreateEventW(NULL, FALSE, FALSE, NULL);
++                    if (!ev)
++                    {
++                        VirtualFree(buf, 0, MEM_RELEASE);
++                        SetLastError(ERROR_OUTOFMEMORY);
++                        return FALSE;
++                    }
++                    *(void **)out_buff = buf;
++                    *(ULONG *)((char *)out_buff + 4) = notif_size;
++                    *(ULONG *)((char *)out_buff + 8) = 0; /* CallMemoryBarrier */
++                    *(ULONG *)((char *)out_buff + 12) = 8; /* NotificationCount */
++                    *(HANDLE *)((char *)out_buff + 16) = ev;
++                    if (returned) *returned = 20;
++                    memset(&kp, 0, sizeof(kp));
++                    kp.cmd = 5;
++                    kp.buffer = buf;
++                    kp.bytes = notif_size;
++                    /* event HANDLE + stride ride in rate/channels: these fields
++                     * are moved by the wow64 thunk's scalar path, which is
++                     * proven reliable (the xmm-copied used/total_lo fields
++                     * arrive zeroed through the wow64 unix-call layer). */
++                    kp.rate = (unsigned int)(UINT_PTR)ev;  /* HANDLE */
++                    kp.channels = notif_size / 8;          /* stride */
++                    realtone_ks_call(&kp);
++                    rtaudio_bufs[idx] = buf;
++                    rtaudio_sizes[idx] = notif_size;
++                    rtaudio_starts[idx] = GetTickCount();
++                    realtone_ks_mode[idx] = 2;
++                    realtone_ks_ensure_started();
++                    TRACE("Realtone diagnostic: RTAUDIO BUFFER_WITH_NOTIFICATION -> buf=%p size=%lx ev=%p\n",
++                          buf, (unsigned long)notif_size, ev);
++                    SetLastError(0);
++                    return TRUE;
++                }
++                SetLastError(ERROR_MORE_DATA);
++                if (returned) *returned = 20;
++                return FALSE;
++            }
++            if (idx < 8 && (id == 6 || id == 7) && (flags & 0x00000002))
++            {
++                /* notification/wake event registration SET: accepted */
++                TRACE("Realtone diagnostic: RTAUDIO notif event SET id=%lu accepted\n", (unsigned long)id);
++                SetLastError(0);
++                if (returned) *returned = 0;
++                return TRUE;
++            }
++            /* id 1 (position register): fail -> PortAudio falls back to
++             * polled position via KSPROPERTY_AUDIO_POSITION (by design). */
++        }
++        else if (set0 == 0x6a174ac0 && id == 2)
++        {
++            /* KSPROPERTY_CONNECTION_STATE */
++            int idx = realtone_slot_of(handle);
++
++            if ((flags & 0xfffffff9) == 0x00000001) /* GET */
++            {
++                if (out_buff && out_count >= 4)
++                {
++                    *(DWORD *)out_buff = rtaudio_states[idx];
++                    if (returned) *returned = 4;
++                    TRACE("Realtone diagnostic: CONNECTION_STATE -> %lu\n", (unsigned long)rtaudio_states[idx]);
++                    SetLastError(0);
++                    return TRUE;
++                }
++                SetLastError(ERROR_MORE_DATA);
++                if (returned) *returned = 4;
++                return FALSE;
++            }
++            if (in_count >= 28)
++            {
++                rtaudio_states[idx] = *(const DWORD *)((const char *)in_buff + 24);
++                TRACE("Realtone diagnostic: CONNECTION_STATE set to %lu\n", (unsigned long)rtaudio_states[idx]);
++                if (rtaudio_states[idx] == 3) /* KSSTATE_RUN: the pin is live */
++                    realtone_ks_ensure_started();
++                SetLastError(0);
++                if (returned) *returned = 0;
++                return TRUE;
++            }
++        }
++        else if (set0 == 0x1155a920)
++        {
++            /* KSPROPSETID_Audio: the capture pin only needs POSITION here
++             * (KSAUDIO_POSITION = {PlayOffset, WriteOffset}, both ULONGLONG).
++             * Realtone: driven by the real capture — poll mode pumps the
++             * cable's audio into the cyclic buffer here and reports the real
++             * write position; packet mode reports bytes served via
++             * IOCTL_KS_READ_STREAM. Falls back to the old time-based fake
++             * when the capture bridge isn't available. */
++            int idx = realtone_slot_of(handle);
++
++            if ((flags & 0xfffffff9) == 0x00000001)
++            {
++                if (out_buff && out_count >= 16)
++                {
++                    ULONG size = rtaudio_sizes[idx];
++                    ULONGLONG pos = 0;
++                    BOOL real = FALSE;
++
++                    realtone_ks_ensure_started();
++                    if (realtone_ks_mode[idx] == 2 || (realtone_ks_mode[idx] == 0 && rtaudio_bufs[idx]))
++                    {
++                        struct realtone_ks_params kp;
++                        memset(&kp, 0, sizeof(kp));
++                        kp.cmd = 4; /* pump ring -> cyclic buffer */
++                        kp.buffer = rtaudio_bufs[idx];
++                        kp.bytes = size;
++                        if (realtone_ks_call(&kp) && !kp.status)
++                        {
++                            ULONGLONG total = (ULONGLONG)kp.total_lo | ((ULONGLONG)kp.total_hi << 32);
++                            pos = size ? total % size : 0;
++                            real = TRUE;
++                            realtone_ks_mode[idx] = 2;
++                            if ((kp.total_lo & 0x3ffff) == 0 && kp.total_lo)
++                                TRACE("Realtone: KS poll pump total=%s pos=%s\n",
++                                      wine_dbgstr_longlong(total), wine_dbgstr_longlong(pos));
++                        }
++                    }
++                    else if (realtone_ks_mode[idx] == 1)
++                    {
++                        pos = size ? realtone_ks_served[idx] % size : 0;
++                        real = TRUE;
++                    }
++                    if (!real)
++                    {
++                        DWORD elapsed = GetTickCount() - rtaudio_starts[idx];
++                        ULONGLONG frames = (ULONGLONG)elapsed * 44; /* ~44.1 kHz */
++                        pos = size ? (frames * 2) % size : 0; /* mono 16-bit */
++                    }
++                    *(ULONGLONG *)out_buff = pos;
++                    *(ULONGLONG *)((char *)out_buff + 8) = pos;
++                    if (returned) *returned = 16;
++                    TRACE("Realtone diagnostic: AUDIO_POSITION -> %s%s\n", wine_dbgstr_longlong(pos), real ? " (real)" : "");
++                    SetLastError(0);
++                    return TRUE;
++                }
++                SetLastError(ERROR_MORE_DATA);
++                if (returned) *returned = 16;
++                return FALSE;
++            }
++            if ((flags & 0x00000006) == 0x00000002 && out_buff && out_count >= 4)
++            {
++                *(DWORD *)out_buff = 0x00000003;
++                if (returned) *returned = 4;
++                SetLastError(0);
++                return TRUE;
++            }
++        }
++
++        if (in_count >= 24 && (flags & 0xfffffff9) == 0x00000001) /* KSPROPERTY_TYPE_GET */
++        {
++            /* Byte-exact answers captured from the real cable on Windows
++             * (tools/ksprobe/results/ksprobe-output.txt). */
++            static const unsigned char gen1[72] = {
++                0x48,0x00,0x00,0x00,0x04,0x00,0x00,0x00,
++                0xe0,0x7f,0x83,0x4d,0x55,0xc5,0xd0,0x11,0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1,
++                0xe0,0xb9,0xb7,0x9d,0x55,0xc5,0xd0,0x11,0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1,
++                0xc0,0x23,0xb2,0x02,0x57,0xc5,0xd0,0x11,0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1,
++                0x00,0xcc,0x5a,0x3a,0x57,0xc5,0xd0,0x11,0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1,
++            };
++            static const unsigned char gen2[88] = {
++                0x58,0x00,0x00,0x00,0x05,0x00,0x00,0x00,
++                0xff,0xff,0xff,0xff,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++                0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++                0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,
++                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++                0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++            };
++            static const unsigned char topo0[72] = {
++                0x8c,0xff,0x1c,0x4e,0x79,0x16,0x3b,0x46,0xa7,0x2f,0xa5,0xbf,0x64,0xc8,0x6e,0xba,
++                0x5d,0x5b,0xcc,0xab,0x63,0xc2,0x3b,0x46,0xa7,0x2f,0xa5,0xbf,0x64,0xc8,0x6e,0xba,
++                0xf0,0x75,0x12,0x8f,0xe9,0x26,0x64,0x42,0xba,0x4d,0x39,0xff,0xf0,0x1d,0x94,0xaa,
++                0x02,0x63,0x57,0xfc,0x07,0x2f,0x3b,0x46,0xa7,0x2f,0xa5,0xbf,0x64,0xc8,0x6e,0xba,
++                0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++            };
++            static const unsigned char dr0[96] = {
++                0x60,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x58,0x00,0x00,0x00,
++                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++                0x61,0x75,0x64,0x73,0x00,0x00,0x10,0x00,0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,
++                0x01,0x00,0x00,0x00,0x00,0x00,0x10,0x00,0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,
++                0x81,0x9f,0x58,0x05,0x56,0xc3,0xce,0x11,0xbf,0x01,0x00,0xaa,0x00,0x55,0x59,0x5a,
++                0x01,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x10,0x00,0x00,0x00,
++                0x40,0x1f,0x00,0x00,0x80,0xbb,0x00,0x00,0x00,0x00,0x00,0x00,
++            };
++            static const unsigned char dr1[72] = {
++                0x48,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x40,0x00,0x00,0x00,
++                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++                0x61,0x75,0x64,0x73,0x00,0x00,0x10,0x00,0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,
++                0x90,0x31,0xba,0x6d,0xbd,0x67,0xcf,0x11,0xa0,0xf7,0x00,0x20,0xaf,0xd1,0x56,0xe4,
++                0xd6,0x17,0x64,0x0f,0x18,0xc3,0xd0,0x11,0xa4,0x3f,0x00,0xa0,0xc9,0x22,0x31,0x96,
++            };
++            static const unsigned char ifaces[32] = {
++                0x20,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++                0xa0,0x66,0x87,0x1a,0xce,0x62,0xcf,0x11,0xa5,0xd6,0x28,0xdb,0x04,0xc1,0x00,0x00,
++                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++            };
++            static const unsigned char mediums[32] = {
++                0x20,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
++                0x20,0xb3,0x47,0x47,0xce,0x62,0xcf,0x11,0xa5,0xd6,0x28,0xdb,0x04,0xc1,0x00,0x00,
++                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++            };
++            static const unsigned char cat0[16] = {
++                0x81,0x42,0x6c,0xfb,0x53,0x03,0xd1,0x11,0x90,0x5f,0x00,0x00,0xc0,0xcc,0x16,0xba,
++            };
++            static const unsigned char cat1[16] = {
++                0xe1,0x1b,0xf2,0xdf,0x0f,0xf7,0xd0,0x11,0xb9,0x17,0x00,0xa0,0xc9,0x22,0x31,0x96,
++            };
++            static const unsigned char nm0[16] = {
++                0x43,0,0x61,0,0x70,0,0x74,0,0x75,0,0x72,0,0x65,0,0,0,
++            };
++            static const unsigned char nm1[22] = {
++                0x4d,0,0x69,0,0x63,0,0x72,0,0x6f,0,0x70,0,0x68,0,0x6f,0,0x6e,0,0x65,0,0,0,
++            };
++            const unsigned char *data = NULL;
++            DWORD dsize = 0, val = 0;
++            DWORD cinst[2] = {1, 0};   /* KSPIN_CINSTANCES: PossibleCount=1, CurrentCount=0 */
++            static const unsigned char adcnm[8] = { 'A',0,'D',0,'C',0,0,0 };
++
++            if (set0 == 0x8c134960) /* KSPROPSETID_Pin */
++            {
++                switch (id)
++                {
++                case 0: data = (const unsigned char *)cinst; dsize = 8; break; /* CINSTANCES */
++                case 1: val = 2; break;                /* CTYPES: 2 pins */
++                case 2: val = pinid ? 1 : 2; break;    /* DATAFLOW */
++                case 3: data = pinid ? dr1 : dr0; dsize = pinid ? sizeof(dr1) : sizeof(dr0); break;
++                case 5: data = ifaces;  dsize = sizeof(ifaces);  break;
++                case 6: data = mediums; dsize = sizeof(mediums); break;
++                case 7: val = pinid ? 4 : 3; break;    /* observed 3 / 4 */
++                case 9: val = 0; break;                /* NECESSARYINSTANCES */
++                case 11: data = pinid ? cat1 : cat0; dsize = 16; break;
++                case 12: data = pinid ? nm1 : nm0; dsize = pinid ? sizeof(nm1) : sizeof(nm0); break;
++                /* ids 4,8,10,13..24: real device FAILS these (ksprobe ok=0)
++                 * -> fall through to the failure path below. */
++                }
++            }
++            else if (set0 == 0x720d4ac0) /* KSPROPSETID_Topology */
++            {
++                if (id == 0) { data = topo0; dsize = sizeof(topo0); } /* CATEGORIES */
++                else if (id == 1) { data = gen1; dsize = sizeof(gen1); } /* CONNECTIONS */
++                else if (id == 2) { data = gen2; dsize = sizeof(gen2); } /* NODES */
++                else if (id == 3) { data = adcnm; dsize = sizeof(adcnm); } /* NAME "ADC" */
++            }
++            else if (set0 == 0x1464eda5) /* KSPROPSETID_General */
++            {
++                if (id == 0) { data = topo0; dsize = sizeof(topo0); } /* COMPONENTID */
++            }
++
++            if (data)
++            {
++                if (out_buff && out_count >= dsize)
++                {
++                    memcpy( out_buff, data, dsize );
++                    if (returned) *returned = dsize;
++                    TRACE( "Realtone diagnostic: KS answer set=%08x id=%u -> %u bytes\n",
++                           (unsigned)set0, (unsigned)id, (unsigned)dsize );
++                    SetLastError( 0 );
++                    return TRUE;
++                }
++                /* Windows semantics: short buffer -> FALSE + ERROR_MORE_DATA
++                 * with the needed size (the game's size-query dance). */
++                TRACE( "Realtone diagnostic: KS answer set=%08x id=%u -> MORE_DATA need=%u\n",
++                       (unsigned)set0, (unsigned)id, (unsigned)dsize );
++                SetLastError( ERROR_MORE_DATA );
++                if (returned) *returned = dsize;
++                return FALSE;
++            }
++            /* val-based answers: the ids the real device answers with a
++             * plain DWORD (CTYPES/DATAFLOW/COMMUNICATION/NECESSARYINSTANCES). */
++            if (set0 == 0x8c134960 && (id == 1 || id == 2 || id == 7 || id == 9))
++            {
++                if (out_buff && out_count >= 4)
++                {
++                    *(DWORD *)out_buff = val;
++                    if (returned) *returned = 4;
++                }
++                TRACE( "Realtone diagnostic: KS answer set=%08x id=%u -> val=%u\n",
++                       (unsigned)set0, (unsigned)id, (unsigned)val );
++                SetLastError( 0 );
++                return TRUE;
++            }
++            /* Everything else: the real device returns an error here
++             * (ksprobe ok=0). Match it byte-for-byte in behavior. */
++            TRACE( "Realtone diagnostic: KS answer set=%08x id=%u -> FAIL\n",
++                   (unsigned)set0, (unsigned)id );
++            SetLastError( ERROR_SET_NOT_FOUND );
++            return FALSE;
++        }
++    }
++
+ 
+     if (overlapped)
+     {
+diff --git a/dlls/ksuser/Makefile.in b/dlls/ksuser/Makefile.in
+index a5458bf..df93b70 100644
+--- a/dlls/ksuser/Makefile.in
++++ b/dlls/ksuser/Makefile.in
+@@ -3,4 +3,5 @@ MODULE    = ksuser.dll
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
++	ksuser.c \
+ 	version.rc
+diff --git a/dlls/ksuser/ksuser.c b/dlls/ksuser/ksuser.c
+new file mode 100644
+index 0000000..6c9740b
+--- /dev/null
++++ b/dlls/ksuser/ksuser.c
+@@ -0,0 +1,70 @@
++/*
++ * ksuser.dll user-mode KS helpers
++ *
++ * Copyright 2026 James (Realtone project)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ksuser);
++
++/* KSPIN_CONNECT layout (ks.h): Interface (GUID+Id+Flags), Medium (GUID+Id+Flags),
++ * PinId, PinToHandle, Priority (Class+SubClass). Only PinId is needed here. */
++typedef struct
++{
++    GUID Set;
++    ULONG Id;
++    ULONG Flags;
++    GUID MediumSet;
++    ULONG MediumId;
++    ULONG MediumFlags;
++    ULONG PinId;
++    HANDLE PinToHandle;
++    ULONG PriorityClass;
++    ULONG PrioritySubClass;
++} KSPIN_CONNECT;
++
++/***********************************************************************
++ *              KsCreatePin (ksuser.@)
++ *
++ * Creates a pin instance on a KS filter. On Windows this is an
++ * NtCreateFile with the KSPIN_CONNECT as the EA buffer, dispatched by
++ * the filter's driver. Until Wine's audio device interfaces are backed
++ * by a real KS driver, a pin handle is represented by duplicating the
++ * filter handle; property/stream IOCTLs on it are answered by the same
++ * handler that serves the filter.
++ */
++DWORD WINAPI KsCreatePin( HANDLE filter, const KSPIN_CONNECT *connect,
++                          ACCESS_MASK access, HANDLE *connection )
++{
++    TRACE( "filter %p, connect %p (pin id %lu, access 0x%08lx), connection %p\n",
++           filter, connect, connect ? (ULONG)connect->PinId : 0, (ULONG)access, connection );
++
++    if (!connection) return ERROR_INVALID_PARAMETER;
++    if (!filter) return ERROR_INVALID_HANDLE;
++    if (!connect) return ERROR_INVALID_PARAMETER;
++
++    if (!DuplicateHandle( GetCurrentProcess(), filter, GetCurrentProcess(),
++                          connection, 0, FALSE, DUPLICATE_SAME_ACCESS ))
++        return GetLastError();
++
++    return ERROR_SUCCESS;
++}
+diff --git a/dlls/ksuser/ksuser.spec b/dlls/ksuser/ksuser.spec
+index 51b84d2..b7d4e99 100644
+--- a/dlls/ksuser/ksuser.spec
++++ b/dlls/ksuser/ksuser.spec
+@@ -1,4 +1,4 @@
+ @ stub KsCreateAllocator
+ @ stub KsCreateClock
+-@ stub KsCreatePin
++@ stdcall KsCreatePin(long ptr long ptr)
+ @ stub KsCreateTopologyNode
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7fd518d..2f7a5f5 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -682,6 +682,32 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+                     const WCHAR *override;
+                     if ((override = find_product_name_override(pv2.pwszVal)) != NULL)
+                         pv.pwszVal = (WCHAR*) override;
++
++                    /* Realtone correlation diagnostic: make the endpoint's
++                     * device-path property carry the same instance as the
++                     * PnP/KS interface registration (Windows derives both
++                     * from one device instance). */
++                    {
++                        static const WCHAR vidpid[] = L"VID_12BA&PID_00FF";
++                        const WCHAR *p = wcsstr(pv2.pwszVal, vidpid);
++                        if (p)
++                        {
++                            /* Windows UAC shape: VID_12BA&PID_00FF&MI_00\9&<port>&0&0000 */
++                            static const WCHAR tail[] = L"&MI_00\\9&39166c3d&0&0000";
++                            size_t prefix = p - pv2.pwszVal + wcslen(vidpid);
++                            WCHAR *fixed = CoTaskMemAlloc((prefix + wcslen(tail) + 1) * sizeof(WCHAR));
++
++                            if (fixed)
++                            {
++                                memcpy(fixed, pv2.pwszVal, prefix * sizeof(WCHAR));
++                                lstrcpyW(fixed + prefix, tail);
++                                MMDevice_SetPropValue(id, flow, &devicepath_key,
++                                        &(PROPVARIANT){ .vt = VT_LPWSTR, .pwszVal = fixed });
++                                TRACE("Realtone correlation: endpoint path instance unified\n");
++                                CoTaskMemFree(fixed);
++                            }
++                        }
++                    }
+                 }
+ 
+                 PropVariantClear(&pv2);
+@@ -854,10 +880,18 @@ static HRESULT set_format(MMDevice *dev)
+     return S_OK;
+ }
+ 
+-HRESULT load_driver_devices(EDataFlow flow)
++struct endpoint_entry {
++    GUID guid;
++    WCHAR *name;
++    EDataFlow flow;
++    BOOL is_default;
++    struct list entry;
++};
++
++/* Enumerate the driver's current endpoints for a flow into out. */
++static HRESULT enumerate_endpoints(EDataFlow flow, struct list *out)
+ {
+     struct get_endpoint_ids_params params;
+-    UINT i;
+ 
+     params.flow = flow;
+     params.size = 1024;
+@@ -868,25 +902,70 @@ HRESULT load_driver_devices(EDataFlow flow)
+         __wine_unix_call(drvs.module_unixlib, get_endpoint_ids, &params);
+     } while (params.result == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+ 
+-    if (FAILED(params.result))
+-        goto end;
++    if (SUCCEEDED(params.result)) {
++        UINT i;
++        for (i = 0; i < params.num; i++) {
++            const WCHAR *name = (WCHAR *)((char *)params.endpoints + params.endpoints[i].name);
++            const char *dev_name = (char *)params.endpoints + params.endpoints[i].device;
++            struct endpoint_entry *entry = malloc(sizeof(*entry));
+ 
+-    for (i = 0; i < params.num; i++) {
+-        GUID guid;
+-        MMDevice *dev;
+-        const WCHAR *name = (WCHAR *)((char *)params.endpoints + params.endpoints[i].name);
+-        const char *dev_name = (char *)params.endpoints + params.endpoints[i].device;
++            if (!entry)
++                continue;
++            entry->flow = flow;
++            entry->is_default = (params.default_idx == i);
++            get_device_guid( flow, dev_name, &entry->guid );
++            entry->name = wcsdup(name);
++            list_add_tail(out, &entry->entry);
++        }
++    }
+ 
+-        get_device_guid( flow, dev_name, &guid );
++    free(params.endpoints);
++    return params.result;
++}
+ 
+-        dev = MMDevice_Create(name, &guid, flow, DEVICE_STATE_ACTIVE, params.default_idx == i);
+-        set_format(dev);
++static void free_endpoint_list(struct list *list)
++{
++    struct endpoint_entry *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, list, struct endpoint_entry, entry) {
++        list_remove(&entry->entry);
++        free(entry->name);
++        free(entry);
+     }
++}
+ 
+-end:
+-    free(params.endpoints);
++HRESULT load_driver_devices(EDataFlow flow)
++{
++    struct list found = LIST_INIT(found);
++    struct endpoint_entry *entry;
++    HRESULT hr = enumerate_endpoints(flow, &found);
+ 
+-    return params.result;
++    if (SUCCEEDED(hr)) {
++        LIST_FOR_EACH_ENTRY(entry, &found, struct endpoint_entry, entry) {
++            MMDevice *dev = MMDevice_Create(entry->name, &entry->guid, flow,
++                    DEVICE_STATE_ACTIVE, entry->is_default);
++            set_format(dev);
++        }
++    }
++
++    free_endpoint_list(&found);
++    return hr;
++}
++
++struct known_endpoint {
++    GUID guid;
++    EDataFlow flow;
++    struct list entry;
++};
++
++static struct list g_known_endpoints = LIST_INIT(g_known_endpoints);
++
++static void build_endpoint_id(const GUID *guid, EDataFlow flow, WCHAR *id)
++{
++    wsprintfW(id, L"{0.0.%u.00000000}.{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++              flow, guid->Data1, guid->Data2, guid->Data3,
++              guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
++              guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
+ }
+ 
+ static void MMDevice_Destroy(MMDevice *This)
+@@ -1462,6 +1541,88 @@ static CRITICAL_SECTION_DEBUG g_notif_lock_debug =
+ };
+ static CRITICAL_SECTION g_notif_lock = { &g_notif_lock_debug, -1, 0, 0, 0, 0 };
+ 
++/* Re-enumerate endpoints, create MMDevice objects for additions, mark
++ * removals NOTPRESENT, and fire OnDeviceAdded/OnDeviceRemoved on the
++ * registered notification clients. Caller must hold g_notif_lock. */
++static void rescan_endpoints_and_notify(void)
++{
++    struct list cur = LIST_INIT(cur);
++    struct endpoint_entry *entry;
++    struct known_endpoint *ke, *ke2;
++    MMDevice *dev;
++    BOOL failed = FALSE;
++
++    if (drvs.module == 0)
++        return;
++
++    if (FAILED(enumerate_endpoints(eRender, &cur)))
++        failed = TRUE;
++    if (!failed && FAILED(enumerate_endpoints(eCapture, &cur)))
++        failed = TRUE;
++    if (failed) {
++        free_endpoint_list(&cur);
++        return;
++    }
++
++    LIST_FOR_EACH_ENTRY(entry, &cur, struct endpoint_entry, entry) {
++        BOOL known = FALSE;
++        struct NotificationClientWrapper *wrapper;
++        WCHAR id[56];
++
++        LIST_FOR_EACH_ENTRY(ke, &g_known_endpoints, struct known_endpoint, entry) {
++            if (ke->flow == entry->flow && IsEqualGUID(&ke->guid, &entry->guid)) {
++                known = TRUE;
++                break;
++            }
++        }
++        if (known)
++            continue;
++
++        if ((ke = malloc(sizeof(*ke)))) {
++            ke->guid = entry->guid;
++            ke->flow = entry->flow;
++            list_add_tail(&g_known_endpoints, &ke->entry);
++        }
++        dev = MMDevice_Create(entry->name, &entry->guid, entry->flow,
++                DEVICE_STATE_ACTIVE, entry->is_default);
++        set_format(dev);
++        TRACE("Endpoint %s added, notifying clients\n", debugstr_w(entry->name));
++        build_endpoint_id(&entry->guid, entry->flow, id);
++        LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
++            IMMNotificationClient_OnDeviceAdded(wrapper->client, id);
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE(ke, ke2, &g_known_endpoints, struct known_endpoint, entry) {
++        BOOL found = FALSE;
++        struct NotificationClientWrapper *wrapper;
++        WCHAR id[56];
++
++        LIST_FOR_EACH_ENTRY(entry, &cur, struct endpoint_entry, entry) {
++            if (entry->flow == ke->flow && IsEqualGUID(&entry->guid, &ke->guid)) {
++                found = TRUE;
++                break;
++            }
++        }
++        if (found)
++            continue;
++
++        LIST_FOR_EACH_ENTRY(dev, &device_list, MMDevice, entry) {
++            if (dev->flow == ke->flow && IsEqualGUID(&dev->devguid, &ke->guid)) {
++                dev->state = DEVICE_STATE_NOTPRESENT;
++                break;
++            }
++        }
++        TRACE("Endpoint removed, notifying clients\n");
++        build_endpoint_id(&ke->guid, ke->flow, id);
++        LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
++            IMMNotificationClient_OnDeviceRemoved(wrapper->client, id);
++        list_remove(&ke->entry);
++        free(ke);
++    }
++
++    free_endpoint_list(&cur);
++}
++
+ static void notify_clients(EDataFlow flow, ERole role, const WCHAR *id)
+ {
+     struct NotificationClientWrapper *wrapper;
+@@ -1571,34 +1732,67 @@ static DWORD WINAPI notif_thread_proc(void *user)
+     if(RegQueryValueExW(key, L"DefaultVoiceInput", 0, NULL, (BYTE*)vin_name, &size) != ERROR_SUCCESS)
+         vin_name[0] = 0;
+ 
+-    while(1){
+-        if(RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET,
+-                    NULL, FALSE) != ERROR_SUCCESS){
+-            ERR("RegNotifyChangeKeyValue failed: %lu\n", GetLastError());
+-            RegCloseKey(key);
+-            g_notif_thread = NULL;
+-            return 1;
++    /* Seed the known-endpoint snapshot without notifications: clients that
++     * register now must only hear about later changes. */
++    {
++        struct list cur = LIST_INIT(cur);
++        struct endpoint_entry *entry;
++        HRESULT hr;
++
++        hr = enumerate_endpoints(eRender, &cur);
++        if (SUCCEEDED(hr))
++            hr = enumerate_endpoints(eCapture, &cur);
++        if (SUCCEEDED(hr)) {
++            LIST_FOR_EACH_ENTRY(entry, &cur, struct endpoint_entry, entry) {
++                struct known_endpoint *ke = malloc(sizeof(*ke));
++                if (ke) {
++                    ke->guid = entry->guid;
++                    ke->flow = entry->flow;
++                    list_add_tail(&g_known_endpoints, &ke->entry);
++                }
++            }
+         }
++        free_endpoint_list(&cur);
++    }
++
++    {
++        HANDLE notify_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 
+-        EnterCriticalSection(&g_notif_lock);
++        while(notify_event){
++            if(RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_LAST_SET,
++                        notify_event, TRUE) != ERROR_SUCCESS){
++                ERR("RegNotifyChangeKeyValue failed: %lu\n", GetLastError());
++                break;
++            }
+ 
+-        notify_if_changed(eRender, eConsole, key, L"DefaultOutput",
+-                out_name, &MMDevice_def_play->IMMDevice_iface);
+-        notify_if_changed(eRender, eCommunications, key, L"DefaultVoiceOutput",
+-                vout_name, &MMDevice_def_play->IMMDevice_iface);
+-        notify_if_changed(eCapture, eConsole, key, L"DefaultInput",
+-                in_name, &MMDevice_def_rec->IMMDevice_iface);
+-        notify_if_changed(eCapture, eCommunications, key, L"DefaultVoiceInput",
+-                vin_name, &MMDevice_def_rec->IMMDevice_iface);
++            /* Wake on default-device registry changes, and at least every
++             * two seconds to pick up endpoint additions/removals reported
++             * by the driver (winepulse refreshes its device lists on pulse
++             * server hotplug events). */
++            WaitForSingleObject(notify_event, 2000);
+ 
+-        LeaveCriticalSection(&g_notif_lock);
+-    }
++            EnterCriticalSection(&g_notif_lock);
+ 
+-    RegCloseKey(key);
++            notify_if_changed(eRender, eConsole, key, L"DefaultOutput",
++                    out_name, &MMDevice_def_play->IMMDevice_iface);
++            notify_if_changed(eRender, eCommunications, key, L"DefaultVoiceOutput",
++                    vout_name, &MMDevice_def_play->IMMDevice_iface);
++            notify_if_changed(eCapture, eConsole, key, L"DefaultInput",
++                    in_name, &MMDevice_def_rec->IMMDevice_iface);
++            notify_if_changed(eCapture, eCommunications, key, L"DefaultVoiceInput",
++                    vin_name, &MMDevice_def_rec->IMMDevice_iface);
++
++            rescan_endpoints_and_notify();
+ 
+-    g_notif_thread = NULL;
++            LeaveCriticalSection(&g_notif_lock);
++        }
+ 
+-    return 0;
++        if (notify_event)
++            CloseHandle(notify_event);
++        RegCloseKey(key);
++        g_notif_thread = NULL;
++        return 1;
++    }
+ }
+ 
+ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEnumerator *iface, IMMNotificationClient *client)
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 964752c..fc58192 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7120,6 +7120,17 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
+            handle, event, apc, apc_context, io, code,
+            in_buffer, in_size, out_buffer, out_size );
+ 
++    /* Realtone diagnostic: log KS property IOCTLs at the ntdll boundary so
++     * probes issued through NtDeviceIoControlFile directly (bypassing
++     * kernelbase's DeviceIoControl diag) stay visible. Probes answered by
++     * the kernelbase diagnostic never reach here. */
++    if (code == 0x2f0003 && in_buffer && in_size >= 8) /* Realtone diag: log all sizes */
++    {
++        const DWORD *kp = in_buffer;
++        WARN( "Realtone diagnostic: ntdll KS probe set=%08x id=%u flags=%u in=%u\n",
++              kp[0], in_size >= 24 ? kp[4] : 0, in_size >= 24 ? kp[5] : 0, in_size );
++    }
++
+     /* some broken applications call this frequently with INVALID_HANDLE_VALUE,
+      * and run slowly if we make a server call every time */
+     if (HandleToLong( handle ) == ~0)
+-- 
+2.56.0
+

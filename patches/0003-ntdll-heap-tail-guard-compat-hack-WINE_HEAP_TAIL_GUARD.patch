@@ -1,0 +1,125 @@
+From 57cc23da2ba825bce7bebd71f9a31519bdaa9440 Mon Sep 17 00:00:00 2001
+From: James <james@realtone.local>
+Date: Thu, 5 Nov 2026 09:30:17 -0600
+Subject: [PATCH] ntdll: heap tail guard compat hack (WINE_HEAP_TAIL_GUARD)
+
+---
+ dlls/ntdll/heap.c       | 26 ++++++++++++++++++++++----
+ dlls/ntdll/loader.c     |  5 +++++
+ dlls/ntdll/ntdll_misc.h |  1 +
+ 3 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/heap.c b/dlls/ntdll/heap.c
+index 1e99799..52d6e39 100644
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -335,6 +335,7 @@ C_ASSERT( HEAP_MIN_LARGE_BLOCK_SIZE <= HEAP_INITIAL_GROW_SIZE );
+ BOOL delay_heap_free = FALSE;
+ BOOL heap_zero_hack = FALSE;
+ BOOL heap_top_down_hack = FALSE;
++BOOL heap_tail_guard = FALSE;
+ 
+ static struct heap *process_heap;  /* main process heap */
+ 
+@@ -2055,11 +2056,18 @@ void heap_thread_detach(void)
+ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE_T size )
+ {
+     struct heap *heap;
+-    SIZE_T block_size;
++    SIZE_T block_size, orig_size = size;
+     void *ptr = NULL;
+     ULONG heap_flags;
+     NTSTATUS status;
+ 
++    /* compatibility hack: over-allocate by 16 bytes and zero them, so that
++     * out-of-bounds reads just past an allocation (as done by some buggy
++     * applications, e.g. Rocksmith 2014's vendored PortAudio reading a
++     * stream field 12 bytes past its heap block) deterministically see 0
++     * instead of whatever lives in the neighbouring block. */
++    if (heap_tail_guard) size += 16;
++
+     heap = unsafe_heap_from_handle( handle, flags, &heap_flags );
+     if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
+         status = STATUS_NO_MEMORY;
+@@ -2081,7 +2089,12 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
+         }
+     }
+ 
+-    if (!status) valgrind_notify_alloc( ptr, size, flags & HEAP_ZERO_MEMORY );
++    if (!status)
++    {
++        if (heap_tail_guard && !(flags & HEAP_ZERO_MEMORY))
++            memset( (char *)ptr + orig_size, 0, 16 );
++        valgrind_notify_alloc( ptr, size, flags & HEAP_ZERO_MEMORY );
++    }
+ 
+     TRACE( "handle %p, flags %#lx, size %#Ix, return %p, status %#lx.\n", handle, flags, size, ptr, status );
+     heap_set_status( heap, flags, status );
+@@ -2245,7 +2258,7 @@ static NTSTATUS heap_resize_in_place( struct heap *heap, ULONG flags, struct blo
+  */
+ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T size )
+ {
+-    SIZE_T block_size, old_size;
++    SIZE_T block_size, old_size, orig_size = size;
+     struct block *block;
+     struct heap *heap;
+     ULONG heap_flags;
+@@ -2254,6 +2267,8 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
+ 
+     if (!ptr) return NULL;
+ 
++    if (heap_tail_guard) size += 16;
++
+     if (!(heap = unsafe_heap_from_handle( handle, flags, &heap_flags )))
+         status = STATUS_INVALID_HANDLE;
+     else if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
+@@ -2265,7 +2280,7 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
+     {
+         if (flags & HEAP_REALLOC_IN_PLACE_ONLY)
+             status = STATUS_NO_MEMORY;
+-        else if (!(ret = RtlAllocateHeap( heap, flags, size )))
++        else if (!(ret = RtlAllocateHeap( heap, flags, orig_size )))
+             status = STATUS_NO_MEMORY;
+         else
+         {
+@@ -2275,6 +2290,9 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
+         }
+     }
+ 
++    if (!status && heap_tail_guard && !(flags & HEAP_ZERO_MEMORY))
++        memset( (char *)ret + orig_size, 0, 16 );
++
+     TRACE( "handle %p, flags %#lx, ptr %p, size %#Ix, return %p, status %#lx.\n", handle, flags, ptr, size, ret, status );
+     heap_set_status( heap, flags, status );
+     return ret;
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 113310a..dec99df 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4674,6 +4674,11 @@ void loader_init( CONTEXT *context, void **entry )
+             ERR( "Enabling heap top down hack.\n" );
+             heap_top_down_hack = TRUE;
+         }
++        if (get_env( L"WINE_HEAP_TAIL_GUARD", env_str, sizeof(env_str)) && env_str[0] == L'1')
++        {
++            ERR( "Enabling heap tail guard hack.\n" );
++            heap_tail_guard = TRUE;
++        }
+ 
+         peb->ProcessHeap        = RtlCreateHeap( heap_flags, NULL, 0, 0, NULL, NULL );
+ 
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 1af5c3d..7a6fd45 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -54,6 +54,7 @@ static const UINT_PTR page_size = 0x1000;
+ extern BOOL delay_heap_free;
+ extern BOOL heap_zero_hack;
+ extern BOOL heap_top_down_hack;
++extern BOOL heap_tail_guard;
+ 
+ /* exceptions */
+ extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
+-- 
+2.56.0
+

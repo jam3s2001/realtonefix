@@ -1,0 +1,59 @@
+From 379fa67942e0c5451e19b22af88e1be6d131f012 Mon Sep 17 00:00:00 2001
+From: James <james@realtone.local>
+Date: Thu, 5 Nov 2026 09:30:18 -0600
+Subject: [PATCH] mmdevapi: serve WASAPI exclusive clients as shared
+
+---
+ dlls/mmdevapi/client.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+index 92a33fe..f660b3e 100644
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -803,17 +803,25 @@ static ULONG WINAPI client_Release(IAudioClient3 *iface)
+     return ref;
+ }
+ 
+-static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE mode, DWORD flags,
++static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE share_mode_in, DWORD flags,
+                                  REFERENCE_TIME duration, REFERENCE_TIME period,
+                                  const WAVEFORMATEX *fmt, const GUID *sessionguid)
+ {
+     struct audio_client *This = impl_from_IAudioClient3(iface);
+ 
+-    TRACE("(%p)->(%x, %lx, %s, %s, %p, %s)\n", This, mode, flags, wine_dbgstr_longlong(duration),
++    TRACE("(%p)->(%x, %lx, %s, %s, %p, %s)\n", This, share_mode_in, flags, wine_dbgstr_longlong(duration),
+                                                wine_dbgstr_longlong(period), fmt,
+                                                debugstr_guid(sessionguid));
+ 
+-    return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid);
++    /* Wine's audio stack has no exclusive mode (unix backends reject it);
++     * serve exclusive clients as shared, matching the silent degradation
++     * seen on modern Windows. */
++    {
++        AUDCLNT_SHAREMODE mode2 = share_mode_in;
++        if (mode2 == AUDCLNT_SHAREMODE_EXCLUSIVE)
++            mode2 = AUDCLNT_SHAREMODE_SHARED;
++        return stream_init(This, TRUE, mode2, flags, duration, period, fmt, sessionguid);
++    }
+ }
+ 
+ static HRESULT WINAPI client_GetBufferSize(IAudioClient3 *iface, UINT32 *out)
+@@ -894,6 +902,13 @@ static HRESULT WINAPI client_IsFormatSupported(IAudioClient3 *iface, AUDCLNT_SHA
+     if (!fmt || (mode == AUDCLNT_SHAREMODE_SHARED && !out))
+         return E_POINTER;
+ 
++    /* Wine's audio stack has no exclusive mode (the unix backends always
++     * reject AUDCLNT_SHAREMODE_EXCLUSIVE). Service exclusive clients as
++     * shared, matching how the applications' own fallbacks behave on
++     * modern Windows where exclusive quietly degrades. */
++    if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE)
++        mode = AUDCLNT_SHAREMODE_SHARED;
++
+     dump_fmt(fmt);
+ 
+     hr = validate_wfx(fmt, mode);
+-- 
+2.56.0
+
