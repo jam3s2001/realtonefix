@@ -48,8 +48,8 @@ if [ -f "$PROTON/version" ]; then
     VER=$(cat "$PROTON/version")
     echo "   Proton version file: $VER"
     case "$VER" in
-        *11.0-100*) : ;;
-        *) warn "prebuilt DLLs were built for Proton Experimental 11.0-100; this is '$VER'."
+        *11.0-100*|*experimental-11.0*) : ;;   # exact builds this was made for
+        *) warn "prebuilt DLLs were built for Proton Experimental 11.0 (wine 11.0); this is '$VER'."
            [ "$FORCE" = 1 ] || { echo "         rerun with --force to try anyway (rollback is automatic)"; exit 1; } ;;
     esac
 fi
